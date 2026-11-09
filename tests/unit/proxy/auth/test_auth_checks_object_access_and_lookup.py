@@ -510,6 +510,56 @@ async def test_enforce_key_access_teamless_all_team_models_passes():
 
 
 @pytest.mark.asyncio
+async def test_enforce_key_access_skips_a2a_model():
+    """_enforce_key_and_fallback_model_access must not deny an a2a model for a key
+    whose explicit model list excludes it. Agent permission is enforced by
+    common_checks instead. Fails if someone re-applies the key model allowlist
+    to agent identifiers."""
+    from litellm.proxy.auth.user_api_key_auth import enforce_key_and_fallback_model_access
+
+    valid_token = UserAPIKeyAuth(
+        api_key="sk-test",
+        team_id="a2a-team",
+        models=["gpt-4o-mini"],
+        team_models=["gpt-4o-mini"],
+    )
+
+    await enforce_key_and_fallback_model_access(
+        valid_token=valid_token,
+        request_data={"model": "a2a/test-a2a-agent"},
+        route="/chat/completions",
+        request=None,
+        llm_model_list=None,
+        llm_router=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_enforce_key_access_still_denies_regular_model_outside_key_list():
+    """The a2a skip above must not leak into regular models: a key whose list
+    excludes gpt-4o is still denied. Fails if the skip is widened past a2a/."""
+    from litellm.proxy.auth.user_api_key_auth import enforce_key_and_fallback_model_access
+
+    valid_token = UserAPIKeyAuth(
+        api_key="sk-test",
+        team_id="a2a-team",
+        models=["gpt-4o-mini"],
+        team_models=["gpt-4o-mini"],
+    )
+
+    with pytest.raises(ProxyException) as exc_info:
+        await enforce_key_and_fallback_model_access(
+            valid_token=valid_token,
+            request_data={"model": "gpt-4o"},
+            route="/chat/completions",
+            request=None,
+            llm_model_list=None,
+            llm_router=None,
+        )
+    assert exc_info.value.type == ProxyErrorTypes.key_model_access_denied
+
+
+@pytest.mark.asyncio
 async def test_can_key_call_resolved_model_teamless_all_team_models_passes():
     """can_key_call_resolved_model must skip the key model check for a teamless
     key with all-team-models. Fails if someone adds a team_id guard to the

@@ -1134,6 +1134,30 @@ def request_skips_budget_checks(
     return is_model_cost_zero(model=model, llm_router=llm_router)
 
 
+def _a2a_agent_name(model: str | list[str] | None) -> str | None:
+    if isinstance(model, str) and model.startswith("a2a/"):
+        return model.removeprefix("a2a/")
+    return None
+
+
+async def _check_a2a_agent_access(agent_name: str, valid_token: UserAPIKeyAuth | None) -> None:
+    from litellm.proxy.agent_endpoints.auth.agent_permission_handler import (
+        AgentRequestHandler,
+    )
+    from litellm.proxy.common_utils.registry_read_through import (
+        get_agent_with_read_through,
+    )
+
+    agent: Final = await get_agent_with_read_through(agent_name)
+    if agent is None:
+        return
+    if not await AgentRequestHandler.is_agent_allowed(agent_id=agent.agent_id, user_api_key_auth=valid_token):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Agent '{agent_name}' is not allowed for your key/team. Contact proxy admin for access.",
+        )
+
+
 async def common_checks(
     request_body: dict,
     team_object: LiteLLM_TeamTable | None,
@@ -1221,8 +1245,12 @@ async def common_checks(
     if team_object is not None and team_object.blocked is True:
         raise Exception(f"Team={team_object.team_id} is blocked. Update via `/team/unblock` if you're an admin.")
 
+    a2a_agent_name: Final = _a2a_agent_name(_model)
+    if a2a_agent_name is not None:
+        await _check_a2a_agent_access(agent_name=a2a_agent_name, valid_token=valid_token)
+
     # 2. If team can call model (or key's access_group_ids grant it)
-    if _model and team_object:
+    if _model and team_object and a2a_agent_name is None:
         with tracer.trace("litellm.proxy.auth.common_checks.can_team_access_model"):
             try:
                 await can_team_access_model(
@@ -1245,7 +1273,7 @@ async def common_checks(
                     raise
 
     # 2.2. If team member has per-member model scope, enforce it
-    if _model and team_object and valid_token and valid_token.user_id:
+    if _model and team_object and valid_token and valid_token.user_id and a2a_agent_name is None:
         with tracer.trace("litellm.proxy.auth.common_checks.check_team_member_model_access"):
             await check_team_member_model_access(
                 model=_model,
@@ -1342,7 +1370,7 @@ async def common_checks(
     )
 
     ## 2.1 If user can call model (if personal key)
-    if _model and team_object is None and user_object is not None:
+    if _model and team_object is None and user_object is not None and a2a_agent_name is None:
         with tracer.trace("litellm.proxy.auth.common_checks.can_user_call_model"):
             await can_user_call_model(
                 model=_model,
@@ -1353,7 +1381,7 @@ async def common_checks(
 
     if end_user_object is not None and end_user_object.models:
         with tracer.trace("litellm.proxy.auth.common_checks.can_customer_call_model"):
-            if _model:
+            if _model and a2a_agent_name is None:
                 can_customer_access_model(
                     model=_model,
                     end_user_object=end_user_object,
@@ -1368,7 +1396,12 @@ async def common_checks(
                     valid_token=valid_token,
                 )
 
-    if _model and valid_token is not None and personal_key_team_model_access_applies(valid_token):
+    if (
+        _model
+        and valid_token is not None
+        and personal_key_team_model_access_applies(valid_token)
+        and a2a_agent_name is None
+    ):
         await can_personal_key_call_model_via_teams(
             model=(
                 *((_model,) if isinstance(_model, str) else _model),
@@ -1386,7 +1419,7 @@ async def common_checks(
     with tracer.trace("litellm.proxy.auth.common_checks.run_project_checks"):
         await _run_project_checks(
             project_object=project_object,
-            _model=_model,
+            _model=_model if a2a_agent_name is None else None,
             llm_router=llm_router,
             skip_budget_checks=skip_all_budget_checks,
             valid_token=valid_token,

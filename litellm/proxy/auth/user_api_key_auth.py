@@ -4709,7 +4709,7 @@ async def enforce_key_and_fallback_model_access(
             team_id=valid_token.team_id,
         )
 
-        if model is not None:
+        if model is not None and not (isinstance(model, str) and model.startswith("a2a/")):
             await can_key_call_model(
                 model=model,
                 llm_model_list=llm_model_list,

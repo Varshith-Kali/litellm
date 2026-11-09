@@ -19,7 +19,7 @@ import pytest, litellm
 
 from tests.unit.redis.stores.auth_cache_double import FakeAuthCache, shared_cache
 import httpx
-from fastapi import Request, status
+from fastapi import HTTPException, Request, status
 from prisma import Prisma
 from litellm._service_logger import ServiceTypes
 from litellm.proxy._types import LiteLLM_OrganizationTable, UserAPIKeyAuth
@@ -31,11 +31,18 @@ from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy._types import (
     LiteLLM_EndUserTable,
     LiteLLM_BudgetTable,
+    LiteLLM_ObjectPermissionTable,
     LiteLLM_UserTable,
     LiteLLM_TeamTable,
     Litellm_EntityType,
     LitellmUserRoles,
+    ProxyErrorTypes,
     ProxyException,
+)
+from litellm.proxy.agent_endpoints.agent_registry import AgentRegistry
+from litellm.proxy.agent_endpoints.auth.agent_permission_handler import (
+    AgentRequestHandler,
+    RestrictedAgentAccess,
 )
 from litellm.proxy.utils import PrismaClient
 import litellm.proxy.common_utils.auth_cache_invalidation_pubsub as pubsub_module
@@ -2469,3 +2476,141 @@ async def test_bulk_eviction_broadcasts_while_the_usage_cache_redis_is_wedged(
 
     assert usage_redis.finished
     assert {json.loads(message)["cache_key"] for message in client.published} == set(hashed_tokens)
+
+
+def _a2a_registry(agent_name: str) -> AgentRegistry:
+    registry: Final = AgentRegistry()
+    registry.load_agents_from_config(
+        [
+            {
+                "agent_name": agent_name,
+                "agent_card_params": {"name": agent_name, "url": "http://localhost", "version": "1.0.0"},
+            }
+        ]
+    )
+    return registry
+
+
+def _a2a_agent_id(registry: AgentRegistry, agent_name: str) -> str:
+    agent: Final = registry.get_agent_by_name(agent_name)
+    assert agent is not None
+    return agent.agent_id
+
+
+async def _run_common_checks_for_model(
+    *,
+    model: str,
+    team: LiteLLM_TeamTable,
+    valid_token: UserAPIKeyAuth,
+) -> bool:
+    request: Final = Request(
+        {"type": "http", "method": "POST", "path": "/v1/chat/completions", "headers": [], "query_string": b""}
+    )
+    return await common_checks(
+        request_body={"model": model, "messages": [{"role": "user", "content": "Hello"}]},
+        team_object=team,
+        user_object=None,
+        end_user_object=None,
+        global_proxy_spend=None,
+        general_settings={},
+        route="/v1/chat/completions",
+        llm_router=None,
+        proxy_logging_obj=MagicMock(spec=ProxyLogging),
+        valid_token=valid_token,
+        request=request,
+        skip_budget_checks=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a2a_chat_completion_allowed_when_agent_granted_on_key_despite_team_allowlist() -> None:
+    agent_name: Final = "test-a2a-agent"
+    registry: Final = _a2a_registry(agent_name)
+    agent_id: Final = _a2a_agent_id(registry, agent_name)
+    team: Final = LiteLLM_TeamTable(team_id="a2a-team", models=["gpt-4o-mini"])
+    valid_token: Final = UserAPIKeyAuth(
+        token="sk-test",
+        team_id="a2a-team",
+        object_permission=LiteLLM_ObjectPermissionTable(object_permission_id="obj-1", agents=[agent_id]),
+    )
+    with patch(
+        "litellm.proxy.agent_endpoints.agent_registry.global_agent_registry",
+        registry,
+    ):
+        assert await _run_common_checks_for_model(model=f"a2a/{agent_name}", team=team, valid_token=valid_token) is True
+
+
+@pytest.mark.asyncio
+async def test_a2a_chat_completion_allowed_when_agent_granted_on_team_despite_team_allowlist() -> None:
+    agent_name: Final = "test-a2a-agent"
+    registry: Final = _a2a_registry(agent_name)
+    agent_id: Final = _a2a_agent_id(registry, agent_name)
+    team: Final = LiteLLM_TeamTable(team_id="a2a-team", models=["gpt-4o-mini"])
+    valid_token: Final = UserAPIKeyAuth(token="sk-test", team_id="a2a-team")
+    with (
+        patch(
+            "litellm.proxy.agent_endpoints.agent_registry.global_agent_registry",
+            registry,
+        ),
+        patch.object(
+            AgentRequestHandler,
+            "_get_allowed_agents_for_team",
+            new=AsyncMock(return_value=RestrictedAgentAccess(frozenset({agent_id}))),
+        ),
+    ):
+        assert await _run_common_checks_for_model(model=f"a2a/{agent_name}", team=team, valid_token=valid_token) is True
+
+
+@pytest.mark.asyncio
+async def test_a2a_chat_completion_denied_when_agent_not_granted() -> None:
+    agent_name: Final = "test-a2a-agent"
+    registry: Final = _a2a_registry(agent_name)
+    team: Final = LiteLLM_TeamTable(team_id="a2a-team", models=["gpt-4o-mini"])
+    valid_token: Final = UserAPIKeyAuth(
+        token="sk-test",
+        team_id="a2a-team",
+        object_permission=LiteLLM_ObjectPermissionTable(object_permission_id="obj-1", agents=["some-other-agent"]),
+    )
+    with (
+        patch(
+            "litellm.proxy.agent_endpoints.agent_registry.global_agent_registry",
+            registry,
+        ),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await _run_common_checks_for_model(model=f"a2a/{agent_name}", team=team, valid_token=valid_token)
+    assert exc_info.value.status_code == status.HTTP_403_FORBIDDEN
+    assert agent_name in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_a2a_chat_completion_allowed_when_no_agent_grant_configured() -> None:
+    agent_name: Final = "test-a2a-agent"
+    registry: Final = _a2a_registry(agent_name)
+    team: Final = LiteLLM_TeamTable(team_id="a2a-team", models=["gpt-4o-mini"])
+    valid_token: Final = UserAPIKeyAuth(token="sk-test", team_id="a2a-team")
+    with patch(
+        "litellm.proxy.agent_endpoints.agent_registry.global_agent_registry",
+        registry,
+    ):
+        assert await _run_common_checks_for_model(model=f"a2a/{agent_name}", team=team, valid_token=valid_token) is True
+
+
+@pytest.mark.asyncio
+async def test_a2a_chat_completion_with_unregistered_agent_defers_to_routing() -> None:
+    team: Final = LiteLLM_TeamTable(team_id="a2a-team", models=["gpt-4o-mini"])
+    valid_token: Final = UserAPIKeyAuth(token="sk-test", team_id="a2a-team")
+    with patch(
+        "litellm.proxy.agent_endpoints.agent_registry.global_agent_registry",
+        _a2a_registry("test-a2a-agent"),
+    ):
+        assert await _run_common_checks_for_model(model="a2a/missing-agent", team=team, valid_token=valid_token) is True
+
+
+@pytest.mark.asyncio
+async def test_regular_model_still_denied_by_team_allowlist() -> None:
+    team: Final = LiteLLM_TeamTable(team_id="a2a-team", models=["gpt-4o-mini"])
+    valid_token: Final = UserAPIKeyAuth(token="sk-test", team_id="a2a-team")
+    with pytest.raises(ProxyException) as exc_info:
+        await _run_common_checks_for_model(model="gpt-4o", team=team, valid_token=valid_token)
+    assert exc_info.value.type == ProxyErrorTypes.team_model_access_denied
