@@ -24,18 +24,20 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     team_membership_reservation_cache_key,
 )
 from litellm.proxy.spend_tracking.budget_reservation import (
+    _estimate_output_tokens,
     _get_team_member_budget_counter,
+    _requested_output_tokens,
+    count_request_input_tokens,
     estimate_request_max_cost,
     get_budget_window_start,
     release_unbound_budget_reservation,
-    count_request_input_tokens,
     reserve_budget_for_request,
 )
 from litellm.proxy.utils import ProxyLogging
-from litellm.router import Router
-from litellm.types.router import Deployment, LiteLLM_Params, ModelInfo
 from litellm.redis.stores.connection import connect
 from litellm.redis.stores.spend_counters import SpendCounterStore
+from litellm.router import Router
+from litellm.types.router import Deployment, LiteLLM_Params, ModelInfo
 
 TOKEN_COUNTING_ROUTES: Final = (
     "/responses/input_tokens",
@@ -631,3 +633,42 @@ def test_fixed_budget_window_requires_duration_and_reset_boundary(window: object
     from litellm.proxy.spend_tracking.budget_reservation import fixed_budget_window
 
     assert fixed_budget_window(window) is None
+
+
+@pytest.mark.parametrize(
+    "request_body,expected",
+    [
+        ({"max_tokens": 1, "max_output_tokens": 1000}, 1000),
+        ({"max_completion_tokens": 50, "max_tokens": 800}, 800),
+        ({"max_tokens": 1, "max_completion_tokens": 800}, 800),
+        ({"max_output_tokens": 500}, 500),
+        ({"max_tokens": 250}, 250),
+        ({"max_completion_tokens": 100}, 100),
+        ({"max_tokens": 0}, 0),
+        ({}, None),
+        ({"inferenceConfig": {"maxTokens": 700}}, 700),
+    ],
+)
+def test_requested_output_tokens_reserves_the_largest_explicit_cap(
+    request_body: dict, expected: int | None
+) -> None:
+    assert _requested_output_tokens(request_body) == expected
+
+
+def test_estimate_output_tokens_clamps_the_largest_cap_at_the_model_ceiling() -> None:
+    assert (
+        _estimate_output_tokens(
+            {"max_tokens": 1, "max_output_tokens": 100000},
+            "/v1/responses",
+            {"max_output_tokens": 4096},
+        )
+        == 4096
+    )
+    assert (
+        _estimate_output_tokens(
+            {"max_tokens": 1, "max_output_tokens": 1000},
+            "/v1/responses",
+            {"max_output_tokens": 4096},
+        )
+        == 1000
+    )

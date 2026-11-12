@@ -1728,7 +1728,12 @@ def _requested_output_tokens(request_body: Mapping[str, object]) -> int | None:
         *(request_body.get(field) for field in _OUTPUT_TOKEN_FIELDS),
         inference_config.get("maxTokens") if isinstance(inference_config, Mapping) else None,
     )
-    return next((tokens for tokens in map(_to_int, candidates) if tokens is not None), None)
+    # Reserve the largest explicit cap. The reservation runs before routing and
+    # cannot know which cap the provider transformation honors (on /v1/responses
+    # only max_output_tokens is forwarded, so a small max_tokens must not mask a
+    # large max_output_tokens). Over-reservation self-corrects at post-call
+    # reconciliation, while under-reservation admits spend past the budget.
+    return max((tokens for tokens in map(_to_int, candidates) if tokens is not None), default=None)
 
 
 def _get_output_multiplier(request_body: dict) -> int:
