@@ -5842,6 +5842,87 @@ class TestDisconnectGatherCleanup:
         assert hook_cancelled is True
 
     @pytest.mark.asyncio
+    async def test_streaming_request_cancelled_on_disconnect_before_first_chunk(self, monkeypatch):
+        """Issue #51393: a streaming request whose client disconnects before the
+        first chunk cancels the in-flight LLM call, even without
+        cancel_on_disconnect. Since 1.107.0 the router reads the first chunk
+        inside the LLM call, so the first-chunk disconnect watch in
+        create_response never runs during that wait."""
+        import asyncio
+
+        import litellm.proxy.common_request_processing as cpr
+        from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+
+        cancelled = asyncio.Event()
+
+        async def slow_llm():
+            try:
+                await asyncio.sleep(9999)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        async def fake_route_request(**_kwargs):
+            return slow_llm()
+
+        mock_logging_obj = MagicMock()
+        mock_logging_obj.litellm_call_id = "test-call-id"
+        mock_logging_obj.defer_async_logging = False
+
+        mock_proxy_logging = MagicMock(spec=ProxyLogging)
+        mock_proxy_logging.during_call_hook = AsyncMock(return_value=None)
+        mock_proxy_logging._callback_capabilities_cache = {}
+
+        monkeypatch.setattr(cpr, "route_request", fake_route_request)
+
+        processing_obj = ProxyBaseLLMRequestProcessing(data={"model": "gemini-2.0-flash", "stream": True})
+        monkeypatch.setattr(
+            processing_obj,
+            "common_processing_pre_call_logic",
+            AsyncMock(return_value=({"model": "gemini-2.0-flash", "stream": True}, mock_logging_obj)),
+        )
+        monkeypatch.setattr(processing_obj, "_has_post_call_guardrails", MagicMock(return_value=False))
+
+        with pytest.raises(HTTPException) as exc_info:
+            await asyncio.wait_for(
+                processing_obj.base_process_llm_request(
+                    request=self._disconnect_request(),
+                    fastapi_response=MagicMock(),
+                    user_api_key_dict=MagicMock(spec=UserAPIKeyAuth),
+                    proxy_logging_obj=mock_proxy_logging,
+                    general_settings={},
+                    proxy_config=MagicMock(spec=ProxyConfig),
+                    route_type="acompletion",
+                    version=None,
+                ),
+                timeout=5,
+            )
+
+        assert exc_info.value.status_code == 499
+        assert "disconnected" in exc_info.value.detail.lower()
+        assert cancelled.is_set()
+
+    @pytest.mark.asyncio
+    async def test_streaming_call_returns_result_when_client_stays_connected(self):
+        """The disconnect watch added for streaming requests must not fail a
+        call whose client stays connected."""
+        import asyncio
+
+        from litellm.proxy.common_request_processing import _await_llm_call_cancelling_on_disconnect
+
+        async def receive():
+            await asyncio.Event().wait()
+
+        async def completed_call():
+            return "answered"
+
+        request = Request(scope={"type": "http", "headers": []}, receive=receive)
+        result = await _await_llm_call_cancelling_on_disconnect(
+            request, asyncio.ensure_future(completed_call()), raise_if_disconnected=True
+        )
+        assert result == "answered"
+
+    @pytest.mark.asyncio
     async def test_cancel_pending_gather_tasks_skips_already_done_tasks(self):
         import asyncio
 

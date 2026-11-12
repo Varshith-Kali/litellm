@@ -2234,11 +2234,13 @@ async def _cancel_llm_call_on_client_disconnect(
 async def _await_llm_call_cancelling_on_disconnect(
     request: Request,
     llm_api_call: "asyncio.Future[_LlmCallT]",
+    *,
+    raise_if_disconnected: bool = False,
 ) -> _LlmCallT:
     disconnect_event: Final = asyncio.Event()
     monitor: Final = asyncio.create_task(_cancel_llm_call_on_client_disconnect(request, llm_api_call, disconnect_event))
     try:
-        return await llm_api_call
+        result: Final = await llm_api_call
     except asyncio.CancelledError:
         if disconnect_event.is_set():
             raise HTTPException(
@@ -2248,6 +2250,15 @@ async def _await_llm_call_cancelling_on_disconnect(
         raise
     finally:
         monitor.cancel()
+        with anyio.CancelScope(shield=True):
+            with contextlib.suppress(asyncio.CancelledError):
+                await monitor
+    if raise_if_disconnected and disconnect_event.is_set():
+        raise HTTPException(
+            status_code=499,
+            detail=_CLIENT_DISCONNECT_DETAIL,
+        )
+    return result
 
 
 def _timing_values(
@@ -3404,9 +3415,14 @@ class ProxyBaseLLMRequestProcessing:
                 *tasks
             )  # run the moderation check in parallel to the actual llm api call
 
+            streaming_request: Final = self._is_streaming_request(
+                data=self.data, is_streaming_request=is_streaming_request
+            )
             try:
-                if general_settings.get("cancel_on_disconnect", False):
-                    responses = await _await_llm_call_cancelling_on_disconnect(request, llm_responses)
+                if general_settings.get("cancel_on_disconnect", False) or streaming_request:
+                    responses = await _await_llm_call_cancelling_on_disconnect(
+                        request, llm_responses, raise_if_disconnected=streaming_request
+                    )
                 else:
                     responses = await llm_responses
             except asyncio.CancelledError:
