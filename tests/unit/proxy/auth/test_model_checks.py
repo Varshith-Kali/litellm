@@ -577,6 +577,169 @@ def test_hosted_vllm_wildcard_listing_sends_the_deployment_extra_headers(monkeyp
     assert listed == ["hosted_vllm/qwen2.5"]
 
 
+@respx.mock
+def test_unprefixed_partial_wildcard_over_a_custom_endpoint_lists_the_endpoint_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import litellm
+    from litellm import Router
+    from litellm.proxy.auth.model_checks import expand_wildcard_deployments_for_model_info, get_complete_model_list
+
+    monkeypatch.setattr(litellm, "check_provider_endpoint", False)
+    gateway_route: Final = respx.get("http://gemini-gateway-51534.test:8317/v1/models").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"id": "gemini-4-example"}, {"id": "gemini-2-flash"}, {"id": "gpt-4o"}]},
+        )
+    )
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "gemini-*",
+                "litellm_params": {
+                    "model": "openai/gemini-*",
+                    "api_base": "http://gemini-gateway-51534.test:8317/v1",
+                    "api_key": "sk-test",
+                },
+            }
+        ]
+    )
+
+    v1_models: Final = get_complete_model_list(
+        key_models=[],
+        team_models=[],
+        proxy_model_list=["gemini-*"],
+        user_model=None,
+        infer_model_from_keys=False,
+        llm_router=router,
+    )
+    model_info_rows: Final = expand_wildcard_deployments_for_model_info(
+        [dict(deployment) for deployment in router.get_model_list() or []], router
+    )
+
+    assert v1_models == ["gemini-4-example", "gemini-2-flash"]
+    assert [str(row["model_name"]) for row in model_info_rows] == v1_models
+    assert [row["litellm_params"]["model"] for row in model_info_rows] == [f"openai/{name}" for name in v1_models]
+    assert gateway_route.called
+    assert [
+        deployment["litellm_params"]["model"]
+        for deployment in router.wildcard_route_deployments("gemini-4-example", None)
+    ] == ["openai/gemini-4-example"]
+
+
+@pytest.mark.parametrize(
+    ("model_name", "deployment_model", "gateway_host", "gateway_json", "gateway_status"),
+    [
+        pytest.param(
+            "gemini-*",
+            "openai/gemini-*",
+            "gw-nomatch-51534.test:8317",
+            {"data": [{"id": "gpt-4o"}]},
+            200,
+            id="non-matching-gateway-ids",
+        ),
+        pytest.param(
+            "tinker/*",
+            "openai/*",
+            "gw-empty-51534.test:8317",
+            {"data": []},
+            200,
+            id="empty-gateway-catalog",
+        ),
+        pytest.param(
+            "tinker/*",
+            "openai/*",
+            "gw-error-51534.test:8317",
+            {"error": "boom"},
+            500,
+            id="gateway-error",
+        ),
+    ],
+)
+@respx.mock
+def test_unprefixed_partial_wildcard_over_a_custom_endpoint_never_lists_the_static_openai_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    deployment_model: str,
+    gateway_host: str,
+    gateway_json: dict[str, object],
+    gateway_status: int,
+) -> None:
+    import litellm
+    from litellm import Router
+    from litellm.proxy.auth.model_checks import get_complete_model_list
+
+    monkeypatch.setattr(litellm, "check_provider_endpoint", False)
+    gateway_route: Final = respx.get(f"http://{gateway_host}/v1/models").mock(
+        return_value=httpx.Response(gateway_status, json=gateway_json)
+    )
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": model_name,
+                "litellm_params": {
+                    "model": deployment_model,
+                    "api_base": f"http://{gateway_host}/v1",
+                    "api_key": "sk-test",
+                },
+            }
+        ]
+    )
+
+    v1_models: Final = get_complete_model_list(
+        key_models=[],
+        team_models=[],
+        proxy_model_list=[model_name],
+        user_model=None,
+        infer_model_from_keys=False,
+        llm_router=router,
+    )
+
+    assert v1_models == []
+    assert gateway_route.called
+
+
+@respx.mock
+def test_prefixed_partial_wildcard_over_a_custom_endpoint_lists_prefixed_endpoint_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import litellm
+    from litellm import Router
+    from litellm.proxy.auth.model_checks import expand_wildcard_deployments_for_model_info, get_complete_model_list
+
+    monkeypatch.setattr(litellm, "check_provider_endpoint", False)
+    gateway_route: Final = respx.get("http://gw-prefixed-51534.test:8317/v1/models").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "gemini-4-example"}, {"id": "gpt-4o"}]})
+    )
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "openai/gemini-*",
+                "litellm_params": {
+                    "model": "openai/gemini-*",
+                    "api_base": "http://gw-prefixed-51534.test:8317/v1",
+                    "api_key": "sk-test",
+                },
+            }
+        ]
+    )
+
+    v1_models: Final = get_complete_model_list(
+        key_models=[],
+        team_models=[],
+        proxy_model_list=["openai/gemini-*"],
+        user_model=None,
+        infer_model_from_keys=False,
+        llm_router=router,
+    )
+    model_info_rows: Final = expand_wildcard_deployments_for_model_info(
+        [dict(deployment) for deployment in router.get_model_list() or []], router
+    )
+
+    assert v1_models == ["openai/gemini-4-example"]
+    assert [str(row["model_name"]) for row in model_info_rows] == v1_models
+    assert gateway_route.called
+
 
 @respx.mock
 def test_vllm_wildcard_never_lists_the_ids_of_a_configured_vllm_server(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -73,6 +73,10 @@ def _check_wildcard_routing(model: str) -> bool:
     return False
 
 
+def _discovers_from_a_custom_endpoint(litellm_params: LiteLLM_Params | None) -> bool:
+    return litellm_params is not None and litellm_params.api_base is not None
+
+
 def get_provider_models(provider: str, litellm_params: LiteLLM_Params | None = None) -> list[str] | None:
     """
     Returns the list of known models by provider
@@ -81,7 +85,11 @@ def get_provider_models(provider: str, litellm_params: LiteLLM_Params | None = N
         return get_valid_models(litellm_params=litellm_params)
 
     if provider in litellm.models_by_provider:
-        provider_models: Final = get_valid_models(custom_llm_provider=provider, litellm_params=litellm_params)
+        provider_models: Final = get_valid_models(
+            check_provider_endpoint=_discovers_from_a_custom_endpoint(litellm_params),
+            custom_llm_provider=provider,
+            litellm_params=litellm_params,
+        )
         return provider_models
 
     try:
@@ -91,7 +99,8 @@ def get_provider_models(provider: str, litellm_params: LiteLLM_Params | None = N
     if ProviderConfigManager.get_provider_model_info(model=None, provider=llm_provider) is None:
         return None
     return get_valid_models(
-        check_provider_endpoint=llm_provider == LlmProviders.LITELLM_PROXY,
+        check_provider_endpoint=llm_provider == LlmProviders.LITELLM_PROXY
+        or _discovers_from_a_custom_endpoint(litellm_params),
         custom_llm_provider=provider,
         litellm_params=litellm_params,
     )
