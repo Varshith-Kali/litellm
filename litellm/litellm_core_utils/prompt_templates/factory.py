@@ -2227,53 +2227,76 @@ def convert_to_anthropic_tool_invoke(
             str,
             get_attribute_or_key(get_attribute_or_key(tool, "function"), "name"),
         )
-        tool_input = parse_tool_call_arguments(
-            get_attribute_or_key(get_attribute_or_key(tool, "function"), "arguments"),
-            tool_name=tool_name,
-            context="Anthropic tool invoke",
-        )
-
+        raw_arguments = get_attribute_or_key(get_attribute_or_key(tool, "function"), "arguments")
+        try:
+            tool_inputs = (
+                parse_tool_call_arguments(
+                    raw_arguments,
+                    tool_name=tool_name,
+                    context="Anthropic tool invoke",
+                ),
+            )
+        except ValueError:
+            salvaged = salvage_concatenated_tool_arguments(raw_arguments) if isinstance(raw_arguments, str) else ()
+            if not salvaged:
+                raise
+            tool_inputs = salvaged
         server_tool_result = (
             None
             if tool_id in answered_tool_ids
             else find_anthropic_server_tool_result(tool_id, web_search_results, tool_results)
         )
-        if server_tool_result is not None:
-            anthropic_tool_invoke.append(
-                {
-                    "type": "server_tool_use",
-                    "id": tool_id,
-                    "name": tool_name,
-                    "input": tool_input,
-                }
-            )
-            anthropic_tool_invoke.append(server_tool_result)
-        elif is_anthropic_tool_search_use(tool_id, tool_name) and tool_id not in answered_tool_ids:
+        if (
+            server_tool_result is None
+            and is_anthropic_tool_search_use(tool_id, tool_name)
+            and tool_id not in answered_tool_ids
+        ):
             continue
-        elif (
-            tool_id in server_tool_call_ids or is_anthropic_server_tool_use(tool_id)
-        ) and tool_id not in answered_tool_ids:
-            anthropic_tool_invoke.append(
-                {"type": "server_tool_use", "id": tool_id, "name": tool_name, "input": tool_input}
+        tool_ids: Final = (
+            cast(
+                tuple[str, ...],
+                _split_tool_call_ids(((tool_id, len(tool_inputs)),))[0],
             )
-        else:
-            sanitized_tool_id = sanitize_anthropic_tool_use_id(tool_id)
-            _anthropic_tool_use_param = AnthropicMessagesToolUseParam(
-                type="tool_use",
-                id=sanitized_tool_id,
-                name=tool_name,
-                input=tool_input,
-            )
+            if len(tool_inputs) > 1
+            else (tool_id,)
+        )
+        for input_index, (block_id, tool_input) in enumerate(zip(tool_ids, tool_inputs, strict=True)):
+            is_last_input: Final = input_index == len(tool_inputs) - 1
+            if server_tool_result is not None:
+                anthropic_tool_invoke.append(
+                    {
+                        "type": "server_tool_use",
+                        "id": block_id,
+                        "name": tool_name,
+                        "input": tool_input,
+                    }
+                )
+                if input_index == 0:
+                    anthropic_tool_invoke.append(server_tool_result)
+            elif (
+                tool_id in server_tool_call_ids or is_anthropic_server_tool_use(tool_id)
+            ) and tool_id not in answered_tool_ids:
+                anthropic_tool_invoke.append(
+                    {"type": "server_tool_use", "id": block_id, "name": tool_name, "input": tool_input}
+                )
+            else:
+                _anthropic_tool_use_param = AnthropicMessagesToolUseParam(
+                    type="tool_use",
+                    id=sanitize_anthropic_tool_use_id(block_id),
+                    name=tool_name,
+                    input=tool_input,
+                )
 
-            _content_element = add_cache_control_to_content(
-                anthropic_content_element=_anthropic_tool_use_param,
-                original_content_element=dict(tool),
-            )
+                if is_last_input:
+                    _content_element = add_cache_control_to_content(
+                        anthropic_content_element=_anthropic_tool_use_param,
+                        original_content_element=dict(tool),
+                    )
 
-            if "cache_control" in _content_element:
-                _anthropic_tool_use_param["cache_control"] = _content_element["cache_control"]
+                    if "cache_control" in _content_element:
+                        _anthropic_tool_use_param["cache_control"] = _content_element["cache_control"]
 
-            anthropic_tool_invoke.append(_anthropic_tool_use_param)
+                anthropic_tool_invoke.append(_anthropic_tool_use_param)
 
     return anthropic_tool_invoke
 

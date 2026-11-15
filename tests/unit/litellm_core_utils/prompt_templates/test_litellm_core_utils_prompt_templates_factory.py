@@ -8208,6 +8208,141 @@ def test_convert_to_anthropic_tool_invoke_mixed_tools():
     assert result[2]["id"] == "toolu_01XYZ789"
 
 
+def test_convert_to_anthropic_tool_invoke_concatenated_json():
+    """
+    Tool call arguments holding several JSON objects back to back are split
+    into one tool_use block per object instead of raising.
+
+    Fixes: https://github.com/BerriAI/litellm/issues/51954
+    """
+    tool_calls = [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "ls",
+                "arguments": '{"path": "/a"}{"path": "/b"}',
+            },
+        }
+    ]
+
+    result = convert_to_anthropic_tool_invoke(tool_calls)
+
+    assert result == [
+        {"type": "tool_use", "id": "call_1", "name": "ls", "input": {"path": "/a"}},
+        {"type": "tool_use", "id": "call_1__concat_1", "name": "ls", "input": {"path": "/b"}},
+    ]
+
+
+def test_convert_to_anthropic_tool_invoke_single_object_arguments_unchanged():
+    """A well-formed single JSON object still yields exactly one tool_use block."""
+    tool_calls = [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "ls",
+                "arguments": '{"path": "/a"}',
+            },
+        }
+    ]
+
+    result = convert_to_anthropic_tool_invoke(tool_calls)
+
+    assert result == [
+        {"type": "tool_use", "id": "call_1", "name": "ls", "input": {"path": "/a"}},
+    ]
+
+
+def test_anthropic_tool_invoke_concatenated_json_tool_result_pairs():
+    """
+    The follow-up tool result still pairs with a valid id after the split.
+    The first split block keeps the original call id, so the tool_result
+    references a tool_use block Anthropic accepts.
+
+    Fixes: https://github.com/BerriAI/litellm/issues/51954
+    """
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
+    messages = [
+        {"role": "user", "content": "List files in /a and /b"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "ls",
+                        "arguments": '{"path": "/a"}{"path": "/b"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "a.txt"},
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "ls",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            },
+        }
+    ]
+
+    outbound = AnthropicConfig().transform_request(
+        model="claude-sonnet-5-5",
+        messages=messages,
+        optional_params={"tools": tools},
+        litellm_params={},
+        headers={},
+    )
+
+    assistant_blocks = outbound["messages"][1]["content"]
+    assert [block["id"] for block in assistant_blocks] == ["call_1", "call_1__concat_1"]
+    assert [block["input"] for block in assistant_blocks] == [{"path": "/a"}, {"path": "/b"}]
+
+    tool_result = outbound["messages"][2]["content"][0]
+    assert tool_result["type"] == "tool_result"
+    assert tool_result["tool_use_id"] in {block["id"] for block in assistant_blocks}
+
+
+def test_convert_to_anthropic_tool_invoke_tool_search_with_result_still_replays():
+    """
+    A tool search call with a stored result is replayed, not dropped. The
+    drop only applies when no result is stored for it.
+    """
+    tool_calls = [
+        {
+            "id": "srvtoolu_01ABC123",
+            "type": "function",
+            "function": {
+                "name": "tool_search_tool_regex",
+                "arguments": '{"query": "elephant weight"}',
+            },
+        }
+    ]
+    web_search_results = [
+        {
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_01ABC123",
+            "content": [{"url": "https://example.com", "title": "Test"}],
+        }
+    ]
+
+    result = convert_to_anthropic_tool_invoke(tool_calls, web_search_results=web_search_results)
+
+    assert len(result) == 2
+    assert result[0]["type"] == "server_tool_use"
+    assert result[0]["id"] == "srvtoolu_01ABC123"
+    assert result[1]["type"] == "web_search_tool_result"
+
+
 def test_anthropic_messages_pt_with_server_tool_use():
     """
     Test that anthropic_messages_pt correctly reconstructs server_tool_use from provider_specific_fields.
