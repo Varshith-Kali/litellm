@@ -150,6 +150,19 @@ class _EmptyPollsThenMessagePubSub(_QueuePubSub):
         return await super().get_message(ignore_subscribe_messages=ignore_subscribe_messages, timeout=timeout)
 
 
+class _IdleAfterFirstPubSub(_QueuePubSub):
+    def __init__(self, initial_messages: Iterable[object] = ()) -> None:
+        super().__init__(initial_messages=initial_messages)
+        self.delivered_first = False
+
+    async def get_message(self, *, ignore_subscribe_messages: bool, timeout: float) -> object | None:
+        if self.delivered_first:
+            await asyncio.sleep(min(timeout, 0.01))
+            return None
+        self.delivered_first = True
+        return await super().get_message(ignore_subscribe_messages=ignore_subscribe_messages, timeout=timeout)
+
+
 class _FakeClock:
     def __init__(self, now: float = 1000.0) -> None:
         self.now = now
@@ -747,6 +760,108 @@ async def test_failing_resync_callback_does_not_kill_subscriber() -> None:
     await subscriber.stop()
 
     assert resyncs == ["resync", "resync"]
+
+
+async def test_failed_resync_callback_recovers_without_another_notification() -> None:
+    pubsub = _IdleAfterFirstPubSub(initial_messages=["change"])
+    cache = _FakeRedisCache(_ScriptedPubSubRedisClient([pubsub]))
+    attempts: list[str] = []
+    recovered = asyncio.Event()
+
+    async def reload_config() -> None:
+        attempts.append("attempt")
+        if len(attempts) == 1:
+            raise TimeoutError("temporary database timeout")
+        recovered.set()
+
+    subscriber = ConfigSyncSubscriber(
+        redis_cache=cache,
+        resync_callbacks=(reload_config,),
+        debounce_seconds=0.01,
+        jitter_max_seconds=0.0,
+        min_resync_interval_seconds=0.0,
+        backoff_initial_seconds=0.01,
+        backoff_max_seconds=0.01,
+    )
+
+    subscriber.start()
+    try:
+        await asyncio.wait_for(recovered.wait(), timeout=5)
+        await asyncio.sleep(0.2)
+    finally:
+        await subscriber.stop()
+
+    assert len(attempts) == 2
+
+
+async def test_successful_sibling_callback_is_not_rerun_while_a_callback_recovers() -> None:
+    pubsub = _IdleAfterFirstPubSub(initial_messages=["change"])
+    cache = _FakeRedisCache(_ScriptedPubSubRedisClient([pubsub]))
+    runs: list[str] = []
+    recovered = asyncio.Event()
+
+    async def flaky_reload() -> None:
+        runs.append("flaky")
+        if runs.count("flaky") == 1:
+            raise TimeoutError("temporary database timeout")
+        recovered.set()
+
+    async def steady_reload() -> None:
+        runs.append("steady")
+
+    subscriber = ConfigSyncSubscriber(
+        redis_cache=cache,
+        resync_callbacks=(flaky_reload, steady_reload),
+        debounce_seconds=0.01,
+        jitter_max_seconds=0.0,
+        min_resync_interval_seconds=0.0,
+        backoff_initial_seconds=0.01,
+        backoff_max_seconds=0.01,
+    )
+
+    subscriber.start()
+    try:
+        await asyncio.wait_for(recovered.wait(), timeout=5)
+        await asyncio.sleep(0.2)
+    finally:
+        await subscriber.stop()
+
+    assert runs.count("flaky") == 2
+    assert runs.count("steady") == 1
+
+
+async def test_reconnect_resync_failure_is_retried_without_another_message() -> None:
+    broken = _BrokenPubSub()
+    healthy = _IdleAfterFirstPubSub()
+    cache = _FakeRedisCache(_ScriptedPubSubRedisClient([broken, healthy]))
+    attempts: list[str] = []
+    recovered = asyncio.Event()
+
+    async def reload_config() -> None:
+        attempts.append("attempt")
+        if len(attempts) == 1:
+            raise TimeoutError("temporary database timeout")
+        recovered.set()
+
+    subscriber = ConfigSyncSubscriber(
+        redis_cache=cache,
+        resync_callbacks=(reload_config,),
+        debounce_seconds=0.01,
+        jitter_max_seconds=0.0,
+        min_resync_interval_seconds=0.0,
+        backoff_initial_seconds=0.01,
+        backoff_max_seconds=0.01,
+    )
+
+    subscriber.start()
+    try:
+        await asyncio.wait_for(recovered.wait(), timeout=5)
+        await asyncio.sleep(0.2)
+    finally:
+        await subscriber.stop()
+
+    assert healthy.subscribed_channels == [CONFIG_SYNC_CHANNEL]
+    assert len(attempts) == 2
 
 
 async def test_stop_cancels_subscriber_cleanly() -> None:

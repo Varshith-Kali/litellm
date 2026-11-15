@@ -233,6 +233,7 @@ class ConfigSyncSubscriber:
         "_backoff_initial_seconds",
         "_backoff_max_seconds",
         "_debounce_seconds",
+        "_failed_resync_callbacks",
         "_jitter_max_seconds",
         "_last_resync_at",
         "_min_resync_interval_seconds",
@@ -273,6 +274,7 @@ class ConfigSyncSubscriber:
         self._task: asyncio.Task[None] | None = None
         self._last_resync_at: float | None = None
         self._resync_required = False
+        self._failed_resync_callbacks: tuple[Callable[[], Awaitable[None]], ...] = ()
 
     def start(self) -> None:
         if self._task is not None:
@@ -299,8 +301,7 @@ class ConfigSyncSubscriber:
                 try:
                     await pubsub.subscribe(config_sync_channel(self._redis_cache))
                     if self._resync_required:
-                        await self._debounce_and_resync(pubsub)
-                        self._resync_required = False
+                        self._resync_required = not await self._debounce_and_resync(pubsub)
                     backoff_seconds = self._backoff_initial_seconds
                     await self._consume(pubsub)
                 finally:
@@ -318,21 +319,34 @@ class ConfigSyncSubscriber:
                 backoff_seconds = min(backoff_seconds * 2, self._backoff_max_seconds)
 
     async def _consume(self, pubsub: ConfigSyncPubSub) -> None:
+        retry_backoff_seconds = self._backoff_initial_seconds
         while True:
             message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=_POLL_TIMEOUT_SECONDS)
             if message is None:
+                if self._failed_resync_callbacks:
+                    await self._sleep(retry_backoff_seconds)
+                    retry_backoff_seconds = min(retry_backoff_seconds * 2, self._backoff_max_seconds)
+                    await self._retry_failed_resync_callbacks()
+                    if not self._failed_resync_callbacks:
+                        retry_backoff_seconds = self._backoff_initial_seconds
                 continue
+            retry_backoff_seconds = self._backoff_initial_seconds
             await self._apply(pubsub, message)
             await self._debounce_and_resync(pubsub)
 
-    async def _debounce_and_resync(self, pubsub: ConfigSyncPubSub) -> None:
+    async def _debounce_and_resync(self, pubsub: ConfigSyncPubSub) -> bool:
         await self._apply_until(
             pubsub, self._monotonic() + self._debounce_seconds + self._rng.uniform(0.0, self._jitter_max_seconds)
         )
         await self._apply_until(pubsub, self._next_resync_at())
         await self._drain_pending(pubsub)
-        await self._run_resync_callbacks()
+        failed: Final = await self._run_resync_callbacks(self._resync_callbacks)
+        self._failed_resync_callbacks = failed
+        if failed:
+            self._resync_required = True
+            return False
         self._last_resync_at = self._monotonic()
+        return True
 
     def _next_resync_at(self) -> float:
         if self._last_resync_at is None:
@@ -380,12 +394,30 @@ class ConfigSyncSubscriber:
         except Exception as e:  # noqa: BLE001  # the debounced full resync retries what a targeted apply could not
             verbose_proxy_logger.warning("config sync targeted apply of %s failed: %s", model_ids, e)
 
-    async def _run_resync_callbacks(self) -> None:
-        for callback in self._resync_callbacks:
-            try:
-                await callback()
-            except Exception as e:  # noqa: BLE001  # one failing resync callback must not kill the subscriber
-                verbose_proxy_logger.warning("config sync resync callback failed: %s", e)
+    async def _retry_failed_resync_callbacks(self) -> None:
+        failed: Final = await self._run_resync_callbacks(self._failed_resync_callbacks)
+        self._failed_resync_callbacks = failed
+        if failed:
+            self._resync_required = True
+            return
+        self._last_resync_at = self._monotonic()
+
+    async def _run_resync_callbacks(
+        self, callbacks: tuple[Callable[[], Awaitable[None]], ...]
+    ) -> tuple[Callable[[], Awaitable[None]], ...]:
+        attempts: Final = [await self._attempt_resync_callback(callback) for callback in callbacks]
+        return tuple(failed for failed in attempts if failed is not None)
+
+    @staticmethod
+    async def _attempt_resync_callback(
+        callback: Callable[[], Awaitable[None]],
+    ) -> Callable[[], Awaitable[None]] | None:
+        try:
+            await callback()
+        except Exception as e:  # noqa: BLE001  # one failing resync callback must not kill the subscriber
+            verbose_proxy_logger.warning("config sync resync callback failed: %s", e)
+            return callback
+        return None
 
     @staticmethod
     async def _close_pubsub(pubsub: ConfigSyncPubSub) -> None:
