@@ -1,3 +1,4 @@
+import json
 import sys
 import types
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1024,3 +1025,137 @@ async def test_qdrant_async_embedding_truncates_off_the_event_loop(monkeypatch):
     assert response["data"][0]["embedding"] == [0.1, 0.2]
     assert _token_count("sem-embed", router.aembedding.call_args.kwargs["input"]) == 5
     assert_loop_stayed_free(took, lags)
+
+
+_REFUND_PROMPT_A = "Refund 4,500 cents on charge 'ch_99102000112201' for reason \"card declined at checkout\"!"
+_REFUND_PROMPT_OTHER_CHARGE = (
+    "Refund 4,500 cents on charge 'ch_3MtwBwLkdI9999' for reason \"card declined at checkout\"!"
+)
+_REFUND_TOOL_CALL_RESPONSE = json.dumps(
+    {
+        "id": "chatcmpl-51900",
+        "object": "chat.completion",
+        "created": 1780000000,
+        "model": "claude-sonnet-4-5",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_99102000112201",
+                            "type": "function",
+                            "function": {
+                                "name": "refund_charge",
+                                "arguments": '{"charge_id": "ch_99102000112201", "amount_cents": 4500}',
+                            },
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+    }
+)
+
+
+def _qdrant_hit_response(cache_key_field_name: str):
+    return {
+        "result": [
+            {
+                "payload": {
+                    cache_key_field_name: "test_key",
+                    "text": _REFUND_PROMPT_A,
+                    "response": _REFUND_TOOL_CALL_RESPONSE,
+                },
+                "score": 0.9749,
+            }
+        ]
+    }
+
+
+def test_qdrant_semantic_cache_refuses_tool_call_hit_on_similar_but_different_prompt():
+    with (
+        patch("litellm.llms.custom_httpx.http_handler.get_httpx_client") as mock_sync_client,
+        patch("litellm.llms.custom_httpx.http_handler.get_async_httpx_client"),
+    ):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"result": {"exists": True}}
+
+        mock_sync_client_instance = MagicMock()
+        mock_sync_client_instance.get.return_value = mock_response
+        mock_sync_client.return_value = mock_sync_client_instance
+
+        from litellm.caching.qdrant_semantic_cache import QdrantSemanticCache
+
+        qdrant_cache = QdrantSemanticCache(
+            collection_name="test_collection",
+            qdrant_api_base="http://test.qdrant.local",
+            qdrant_api_key="test_key",
+            similarity_threshold=0.92,
+        )
+
+        mock_search_response = MagicMock()
+        mock_search_response.status_code = 200
+        mock_search_response.json.return_value = _qdrant_hit_response(QdrantSemanticCache.CACHE_KEY_FIELD_NAME)
+        qdrant_cache.sync_client.post = MagicMock(return_value=mock_search_response)
+
+        with patch("litellm.embedding", return_value={"data": [{"embedding": [0.1, 0.2, 0.3]}]}):
+            metadata = {}
+            result = qdrant_cache.get_cache(
+                key="test_key",
+                messages=[{"content": _REFUND_PROMPT_OTHER_CHARGE}],
+                metadata=metadata,
+            )
+
+        assert result is None
+        assert metadata["semantic-similarity"] == pytest.approx(0.9749)
+
+
+@pytest.mark.asyncio
+async def test_qdrant_semantic_cache_async_refuses_tool_call_hit_on_similar_but_different_prompt():
+    with (
+        patch("litellm.llms.custom_httpx.http_handler.get_httpx_client") as mock_sync_client,
+        patch("litellm.llms.custom_httpx.http_handler.get_async_httpx_client") as mock_async_client,
+    ):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"result": {"exists": True}}
+
+        mock_sync_client_instance = MagicMock()
+        mock_sync_client_instance.get.return_value = mock_response
+        mock_sync_client.return_value = mock_sync_client_instance
+
+        mock_async_client_instance = AsyncMock()
+        mock_async_client.return_value = mock_async_client_instance
+
+        from litellm.caching.qdrant_semantic_cache import QdrantSemanticCache
+
+        qdrant_cache = QdrantSemanticCache(
+            collection_name="test_collection",
+            qdrant_api_base="http://test.qdrant.local",
+            qdrant_api_key="test_key",
+            similarity_threshold=0.92,
+        )
+
+        mock_search_response = MagicMock()
+        mock_search_response.status_code = 200
+        mock_search_response.json.return_value = _qdrant_hit_response(QdrantSemanticCache.CACHE_KEY_FIELD_NAME)
+        qdrant_cache.async_client.post = AsyncMock(return_value=mock_search_response)
+
+        with patch(
+            "litellm.aembedding",
+            return_value={"data": [{"embedding": [0.4, 0.5, 0.6]}]},
+        ):
+            metadata = {}
+            result = await qdrant_cache.async_get_cache(
+                key="test_key",
+                messages=[{"content": _REFUND_PROMPT_OTHER_CHARGE}],
+                metadata=metadata,
+            )
+
+        assert result is None
+        assert metadata["semantic-similarity"] == pytest.approx(0.9749)

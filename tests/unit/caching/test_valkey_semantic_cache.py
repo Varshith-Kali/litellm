@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import struct
 from types import SimpleNamespace
@@ -505,3 +506,76 @@ async def test_index_info_uses_valkey_ft_info():
 
     assert result == {"num_docs": 3}
     async_client.ft.assert_called_once_with("test_index")
+
+
+_REFUND_PROMPT_A = "Refund 4,500 cents on charge 'ch_99102000112201' for reason \"card declined at checkout\"!"
+_REFUND_PROMPT_OTHER_CHARGE = (
+    "Refund 4,500 cents on charge 'ch_3MtwBwLkdI9999' for reason \"card declined at checkout\"!"
+)
+_REFUND_TOOL_CALL_RESPONSE = json.dumps(
+    {
+        "id": "chatcmpl-51900",
+        "object": "chat.completion",
+        "created": 1780000000,
+        "model": "claude-sonnet-4-5",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_99102000112201",
+                            "type": "function",
+                            "function": {
+                                "name": "refund_charge",
+                                "arguments": '{"charge_id": "ch_99102000112201", "amount_cents": 4500}',
+                            },
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+    }
+)
+
+
+def test_get_cache_refuses_tool_call_hit_on_similar_but_different_prompt():
+    sync_client = MagicMock()
+    sync_client.ft.return_value.search.return_value = _search_result(0.0251, _REFUND_TOOL_CALL_RESPONSE)
+    cache = _make_cache(sync_client=sync_client, similarity_threshold=0.92)
+    cache._get_embedding = MagicMock(return_value=[0.1, 0.2, 0.3])
+
+    metadata = {}
+    result = cache.get_cache(
+        key="cache-key",
+        messages=[{"role": "user", "content": _REFUND_PROMPT_OTHER_CHARGE}],
+        metadata=metadata,
+    )
+
+    assert result is None
+    assert metadata["semantic-similarity"] == pytest.approx(0.9749)
+
+
+@pytest.mark.asyncio
+async def test_async_get_cache_refuses_tool_call_hit_on_similar_but_different_prompt():
+    search_obj = SimpleNamespace(
+        search=AsyncMock(return_value=_search_result(0.0251, _REFUND_TOOL_CALL_RESPONSE)),
+        create_index=AsyncMock(),
+    )
+    async_client = AsyncMock()
+    async_client.ft = MagicMock(return_value=search_obj)
+    cache = _make_cache(async_client=async_client, similarity_threshold=0.92)
+    cache._get_async_embedding = AsyncMock(return_value=[0.1, 0.2, 0.3])
+
+    metadata = {}
+    result = await cache.async_get_cache(
+        key="cache-key",
+        messages=[{"role": "user", "content": _REFUND_PROMPT_OTHER_CHARGE}],
+        metadata=metadata,
+    )
+
+    assert result is None
+    assert metadata["semantic-similarity"] == pytest.approx(0.9749)

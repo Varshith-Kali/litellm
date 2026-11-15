@@ -37,6 +37,7 @@ from ._embedding_router import (
     resolve_embedding_timeout,
     truncate_embedding_input,
 )
+from ._semantic_cache_utils import cached_response_has_tool_calls
 from .base_cache import BaseCache
 
 _WAIT_FOR_INDEXING: Final = MappingProxyType({"wait": "true"})
@@ -385,7 +386,11 @@ class QdrantSemanticCache(BaseCache):
             print_verbose(
                 f"got a cache hit, similarity: {similarity}, Current prompt: {prompt}, cached_prompt: {cached_prompt}"
             )
-            return self._get_cache_logic(cached_response=cached_value)
+            cached_result: Final = self._get_cache_logic(cached_response=cached_value)
+            if cached_response_has_tool_calls(cached_result):
+                print_verbose("Qdrant semantic-cache hit carries tool calls, treating it as a miss")
+                return None
+            return cached_result
         else:
             # cache miss !
             return None
@@ -492,7 +497,11 @@ class QdrantSemanticCache(BaseCache):
             print_verbose(
                 f"got a cache hit, similarity: {similarity}, Current prompt: {prompt}, cached_prompt: {cached_prompt}"
             )
-            return self._get_cache_logic(cached_response=cached_value)
+            cached_result: Final = self._get_cache_logic(cached_response=cached_value)
+            if cached_response_has_tool_calls(cached_result):
+                print_verbose("Qdrant semantic-cache hit carries tool calls, treating it as a miss")
+                return None
+            return cached_result
         else:
             # cache miss !
             return None

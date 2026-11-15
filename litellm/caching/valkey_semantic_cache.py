@@ -33,6 +33,7 @@ from litellm._uuid import uuid
 from litellm.llms.valkey.common_utils import build_valkey_url, pack_vector
 
 from ._embedding_router import resolve_embedding_timeout
+from ._semantic_cache_utils import cached_response_has_tool_calls
 from .redis_semantic_cache import RedisSemanticCache
 
 _OPAQUE_SEARCH_FIELD: Final = TypeAdapter(object)
@@ -256,7 +257,11 @@ class ValkeySemanticCache(RedisSemanticCache):
 
         if similarity < self.similarity_threshold:
             return None
-        return self._get_cache_logic(cached_response=hit.response)
+        cached_result: Final = self._get_cache_logic(cached_response=hit.response)
+        if cached_response_has_tool_calls(cached_result):
+            print_verbose("Valkey semantic-cache hit carries tool calls, treating it as a miss")
+            return None
+        return cached_result
 
     def set_cache(self, key: str, value: object, **kwargs: object) -> None:
         print_verbose(f"Valkey semantic-cache set_cache, kwargs: {kwargs}")

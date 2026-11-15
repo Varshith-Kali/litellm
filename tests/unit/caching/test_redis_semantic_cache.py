@@ -1,6 +1,7 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 from importlib import import_module
+import json
 import sys
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1475,3 +1476,161 @@ def test_redis_semantic_cache_prompt_extraction_keeps_tool_result_text():
     )
 
     assert prompt == "list the filescalc.py test_calc.py"
+
+
+_REFUND_PROMPT_A = "Refund 4,500 cents on charge 'ch_99102000112201' for reason \"card declined at checkout\"!"
+_REFUND_PROMPT_OTHER_CHARGE = (
+    "Refund 4,500 cents on charge 'ch_3MtwBwLkdI9999' for reason \"card declined at checkout\"!"
+)
+_REFUND_PROMPT_NEGATED = (
+    "Do NOT refund 4,500 cents on charge 'ch_99102000112201' for reason \"card declined at checkout\"!"
+)
+_REFUND_TOOL_CALL_RESPONSE = json.dumps(
+    {
+        "id": "chatcmpl-51900",
+        "object": "chat.completion",
+        "created": 1780000000,
+        "model": "claude-sonnet-4-5",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_99102000112201",
+                            "type": "function",
+                            "function": {
+                                "name": "refund_charge",
+                                "arguments": '{"charge_id": "ch_99102000112201", "amount_cents": 4500}',
+                            },
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
+    }
+)
+_REFUND_FUNCTION_CALL_RESPONSE = json.dumps(
+    {
+        "id": "resp-51900",
+        "object": "response",
+        "created_at": 1780000000,
+        "model": "claude-sonnet-4-5",
+        "output": [
+            {
+                "type": "function_call",
+                "id": "fc_99102000112201",
+                "call_id": "call_99102000112201",
+                "name": "refund_charge",
+                "arguments": '{"charge_id": "ch_99102000112201", "amount_cents": 4500}',
+                "status": "completed",
+            }
+        ],
+    }
+)
+
+
+@pytest.mark.parametrize(
+    ("incoming_prompt", "cached_response", "expected"),
+    [
+        (_REFUND_PROMPT_OTHER_CHARGE, _REFUND_TOOL_CALL_RESPONSE, None),
+        (_REFUND_PROMPT_NEGATED, _REFUND_TOOL_CALL_RESPONSE, None),
+        (_REFUND_PROMPT_OTHER_CHARGE, _REFUND_FUNCTION_CALL_RESPONSE, None),
+        (
+            _REFUND_PROMPT_OTHER_CHARGE,
+            '{"content": "Refund received."}',
+            {"content": "Refund received."},
+        ),
+    ],
+)
+def test_redis_semantic_cache_refuses_tool_call_hit_on_similar_but_different_prompt(
+    monkeypatch, incoming_prompt, cached_response, expected
+):
+    semantic_cache_mock = MagicMock()
+    custom_vectorizer_mock = MagicMock()
+
+    with _fake_redisvl_modules(semantic_cache_mock, custom_vectorizer_mock):
+        from litellm.caching.redis_semantic_cache import RedisSemanticCache
+
+        monkeypatch.setenv("REDIS_HOST", "localhost")
+        monkeypatch.setenv("REDIS_PORT", "6379")
+        monkeypatch.setenv("REDIS_PASSWORD", "test_password")
+
+        redis_semantic_cache = RedisSemanticCache(similarity_threshold=0.92)
+        redis_semantic_cache.llmcache.check = MagicMock(
+            return_value=[
+                {
+                    "prompt": _REFUND_PROMPT_A,
+                    "response": cached_response,
+                    "vector_distance": 0.0251,
+                    RedisSemanticCache.CACHE_KEY_FIELD_NAME: "test_key",
+                }
+            ]
+        )
+
+        with (
+            patch(
+                "litellm.embedding",
+                return_value={"data": [{"embedding": [0.1, 0.2, 0.3]}]},
+            ),
+            patch.object(
+                redis_semantic_cache,
+                "_get_cache_key_filter_expression",
+                return_value="cache-key-filter",
+            ),
+        ):
+            metadata = {}
+            result = redis_semantic_cache.get_cache(
+                key="test_key",
+                messages=[{"content": incoming_prompt}],
+                metadata=metadata,
+            )
+
+        assert result == expected
+        assert metadata["semantic-similarity"] == pytest.approx(0.9749)
+
+
+async def test_redis_semantic_cache_async_refuses_tool_call_hit_on_similar_but_different_prompt(
+    monkeypatch,
+):
+    semantic_cache_mock = MagicMock()
+    custom_vectorizer_mock = MagicMock()
+
+    with _fake_redisvl_modules(semantic_cache_mock, custom_vectorizer_mock):
+        from litellm.caching.redis_semantic_cache import RedisSemanticCache
+
+        monkeypatch.setenv("REDIS_HOST", "localhost")
+        monkeypatch.setenv("REDIS_PORT", "6379")
+        monkeypatch.setenv("REDIS_PASSWORD", "test_password")
+
+        redis_semantic_cache = RedisSemanticCache(similarity_threshold=0.92)
+        redis_semantic_cache.llmcache.acheck = AsyncMock(
+            return_value=[
+                {
+                    "prompt": _REFUND_PROMPT_A,
+                    "response": _REFUND_TOOL_CALL_RESPONSE,
+                    "vector_distance": 0.0251,
+                    RedisSemanticCache.CACHE_KEY_FIELD_NAME: "test_key",
+                }
+            ]
+        )
+        redis_semantic_cache._get_async_embedding = AsyncMock(return_value=[0.1, 0.2, 0.3])
+
+        with patch.object(
+            redis_semantic_cache,
+            "_get_cache_key_filter_expression",
+            return_value="cache-key-filter",
+        ):
+            metadata = {}
+            result = await redis_semantic_cache.async_get_cache(
+                key="test_key",
+                messages=[{"content": _REFUND_PROMPT_OTHER_CHARGE}],
+                metadata=metadata,
+            )
+
+        assert result is None
+        assert metadata["semantic-similarity"] == pytest.approx(0.9749)

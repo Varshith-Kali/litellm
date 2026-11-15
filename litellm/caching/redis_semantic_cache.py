@@ -34,6 +34,7 @@ from ._embedding_router import (
     resolve_embedding_timeout,
     truncate_embedding_input,
 )
+from ._semantic_cache_utils import cached_response_has_tool_calls
 from .base_cache import BaseCache
 
 if TYPE_CHECKING:
@@ -513,7 +514,11 @@ class RedisSemanticCache(BaseCache):
                 f"cached prompt: {cached_prompt}"
             )
 
-            return self._get_cache_logic(cached_response=cached_response)
+            cached_result: Final = self._get_cache_logic(cached_response=cached_response)
+            if cached_response_has_tool_calls(cached_result):
+                print_verbose("Redis semantic-cache hit carries tool calls, treating it as a miss")
+                return None
+            return cached_result
         except Exception as e:
             print_verbose(f"Error retrieving from Redis semantic cache: {e}")
             kwargs.setdefault("metadata", {})["semantic-similarity"] = 0.0
@@ -664,7 +669,11 @@ class RedisSemanticCache(BaseCache):
                 f"cached prompt: {cached_prompt}"
             )
 
-            return self._get_cache_logic(cached_response=cached_response)
+            cached_result: Final = self._get_cache_logic(cached_response=cached_response)
+            if cached_response_has_tool_calls(cached_result):
+                print_verbose("Redis semantic-cache hit carries tool calls, treating it as a miss")
+                return None
+            return cached_result
         except Exception as e:
             print_verbose(f"Error in async_get_cache: {e}")
             kwargs.setdefault("metadata", {})["semantic-similarity"] = 0.0
