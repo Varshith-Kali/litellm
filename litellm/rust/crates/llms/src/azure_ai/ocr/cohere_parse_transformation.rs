@@ -15,6 +15,8 @@ use crate::{
 use litellm_llms_types::formats::ocr::{LiteLLMOcrResponse, OcrDocument, OcrResponseFormat};
 
 pub const AZURE_COHERE_PARSE_PATH: [&str; 4] = ["providers", "cohere", "v2", "parse"];
+pub const AZURE_COHERE_NATIVE_PARSE_PATH: [&str; 2] = ["v2", "parse"];
+const DEDICATED_MODELS_HOST_SUFFIX: &str = ".models.ai.azure.com";
 
 #[derive(Default)]
 pub struct AzureAICohereParseConfig;
@@ -130,12 +132,22 @@ impl AzureAICohereParseConfig {
             url.set_path(&path);
             return Ok(url.into());
         }
+        let target: &[&str] = if is_dedicated_models_host(&url) {
+            &AZURE_COHERE_NATIVE_PARSE_PATH
+        } else {
+            &AZURE_COHERE_PARSE_PATH
+        };
         url.set_path(path.strip_suffix("/models").unwrap_or(&path));
         ApiUrl::parse(url.as_str())
-            .and_then(|url| url.complete_path(&AZURE_COHERE_PARSE_PATH))
+            .and_then(|url| url.complete_path(target))
             .map(|url| url.into_string())
             .map_err(|error| Error::request_field("api_base", error))
     }
+}
+
+fn is_dedicated_models_host(url: &reqwest::Url) -> bool {
+    url.host_str()
+        .is_some_and(|host| host.ends_with(DEDICATED_MODELS_HOST_SUFFIX))
 }
 
 fn invalid_api_base() -> Error {
@@ -147,29 +159,61 @@ fn invalid_api_base() -> Error {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
-    #[test]
-    fn completes_foundry_urls_without_duplicate_paths_and_preserves_queries() {
-        for suffix in [
-            "",
-            "/models",
-            "/providers/cohere/v2",
-            "/providers/cohere/v2/parse",
-        ] {
-            assert_eq!(
-                AzureAICohereParseConfig
-                    .get_complete_url(&format!("https://example.com{suffix}?tenant=a"))
-                    .unwrap(),
-                "https://example.com/providers/cohere/v2/parse?tenant=a"
-            );
-        }
+    #[rstest]
+    #[case::bare_foundry("https://example.com", "https://example.com/providers/cohere/v2/parse")]
+    #[case::models_suffix(
+        "https://example.com/models",
+        "https://example.com/providers/cohere/v2/parse"
+    )]
+    #[case::version_prefix(
+        "https://example.com/providers/cohere/v2",
+        "https://example.com/providers/cohere/v2/parse"
+    )]
+    #[case::complete_foundry(
+        "https://example.com/providers/cohere/v2/parse",
+        "https://example.com/providers/cohere/v2/parse"
+    )]
+    #[case::query(
+        "https://example.com?tenant=a",
+        "https://example.com/providers/cohere/v2/parse?tenant=a"
+    )]
+    #[case::models_suffix_query(
+        "https://example.com/models?tenant=a",
+        "https://example.com/providers/cohere/v2/parse?tenant=a"
+    )]
+    #[case::native_workaround(
+        "https://example.com/v2/parse?tenant=a",
+        "https://example.com/v2/parse?tenant=a"
+    )]
+    #[case::dedicated_bare(
+        "http://example.eastus.models.ai.azure.com",
+        "http://example.eastus.models.ai.azure.com/v2/parse"
+    )]
+    #[case::dedicated_models_suffix(
+        "https://example.eastus.models.ai.azure.com/models",
+        "https://example.eastus.models.ai.azure.com/v2/parse"
+    )]
+    #[case::dedicated_query(
+        "https://example.eastus.models.ai.azure.com?tenant=a",
+        "https://example.eastus.models.ai.azure.com/v2/parse?tenant=a"
+    )]
+    #[case::dedicated_complete(
+        "https://example.eastus.models.ai.azure.com/v2/parse",
+        "https://example.eastus.models.ai.azure.com/v2/parse"
+    )]
+    fn completes_url_for_endpoint_type(#[case] api_base: &str, #[case] expected: &str) {
         assert_eq!(
-            AzureAICohereParseConfig
-                .get_complete_url("https://example.com/v2/parse?tenant=a")
-                .unwrap(),
-            "https://example.com/v2/parse?tenant=a"
+            AzureAICohereParseConfig.get_complete_url(api_base).unwrap(),
+            expected
         );
+    }
+
+    #[test]
+    fn relative_api_base_is_rejected() {
         assert!(
             AzureAICohereParseConfig
                 .get_complete_url("relative/path")
