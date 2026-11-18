@@ -532,7 +532,6 @@ from litellm.proxy.common_request_processing import (  # noqa: F401, RUF100  # l
     should_return_raw_model_name,
     sse_error_payload,
     ttft_keepalive_interval,
-    withheld_provider_output,
 )
 from litellm.proxy.common_utils.anthropic_error_payload import (
     anthropic_error_json_response,
@@ -11077,7 +11076,6 @@ async def async_data_generator(
     )
     stream_source: AsyncIterator[object] | None = None  # rebind-ok: bound once the keepalive policy resolves
     stream_started: bool = False  # rebind-ok: set once a ping or a hook-cleared chunk is sent, then errors go in-band
-    provider_output_started: bool = False  # rebind-ok: set on the first provider chunk, which partial billing settles
     try:
         error_message: str | None = None
         requested_model_from_client: Final = _get_client_requested_model_for_streaming(request_data=request_data)
@@ -11141,7 +11139,6 @@ async def async_data_generator(
                 yield ": ping\n\n"
                 continue
             chunk = item
-            provider_output_started = True
             chunk_received_at = time.perf_counter()
             if needs_per_chunk_hook:
                 ### CALL HOOKS ### - modify outgoing data
@@ -11333,9 +11330,7 @@ async def async_data_generator(
             client_disconnected=client_disconnected,
             user_api_key_dict=user_api_key_dict,
             proxy_logging_obj=proxy_logging_obj,
-            release_reservation_if_unbilled=client_disconnected
-            and not provider_output_started
-            and not withheld_provider_output(_UNTYPED_VALUE.validate_python(response)),
+            release_reservation_if_unbilled=client_disconnected,
         )
 
 

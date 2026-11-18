@@ -7527,6 +7527,58 @@ async def test_async_data_generator_cleanup_on_early_exit():
     mock_response.aclose.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_async_data_generator_releases_budget_reservation_when_responses_stream_abandoned_after_lifecycle_events():
+    """Responses streams relay lifecycle events before any output text, and
+    those events bill nothing, so disconnect billing dispatches no success
+    event. The pre-call reservation must still be settled on disconnect,
+    or the full worst-case reservation stays on the spend counter."""
+    from litellm.proxy.proxy_server import async_data_generator
+
+    reservation = {
+        "reserved_cost": 0.2465,
+        "input_cost": 0.0007,
+        "finalized": False,
+        "callback_bound": True,
+        "entries": [],
+    }
+    user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+    user_api_key_dict.budget_reservation = reservation
+    request_data = {"model": "gpt-5.4", "input": "hi"}
+
+    async def responses_stream():
+        yield {"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}
+        yield {"type": "response.in_progress", "response": {"id": "resp_1", "status": "in_progress"}}
+        await asyncio.Event().wait()
+
+    proxy_logging_obj = types.SimpleNamespace(
+        needs_iterator_wrap=lambda: False,
+        needs_per_chunk_streaming_hook=lambda: False,
+        arelease_max_parallel_requests_on_disconnect=AsyncMock(),
+        arelease_max_parallel_requests=AsyncMock(),
+        post_call_failure_hook=AsyncMock(return_value=None),
+    )
+
+    released: list[object] = []
+
+    async def record_release(budget_reservation: object) -> None:
+        released.append(budget_reservation)
+
+    with (
+        patch("litellm.proxy.proxy_server.proxy_logging_obj", proxy_logging_obj),
+        patch(
+            "litellm.proxy.common_request_processing.release_budget_reservation_on_cancel",
+            new=record_release,
+        ),
+    ):
+        gen = async_data_generator(responses_stream(), user_api_key_dict, request_data)
+        first_chunk = await gen.__anext__()
+        assert first_chunk.startswith("data: ")
+        await gen.aclose()
+
+    assert released == [reservation]
+
+
 class _FakeClock:
     """Hand-advanced stand-in for time.perf_counter, so the hook's cost is exact and no real time passes."""
 

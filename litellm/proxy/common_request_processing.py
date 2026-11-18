@@ -5474,7 +5474,7 @@ class ProxyBaseLLMRequestProcessing:
                     and not success_event_owns_slot_release
                     and user_api_key_dict is not None
                 ):
-                    await release_budget_reservation_on_cancel(user_api_key_dict.budget_reservation)
+                    await release_budget_reservation_on_cancel(getattr(user_api_key_dict, "budget_reservation", None))
 
             if has_attributes(response, _ClosesAsync, "aclose"):
                 try:
